@@ -2,13 +2,14 @@
 
 use rand::RngCore;
 use std::{error::Error, fmt};
+use crate::hexes::HEXES_FLAT;
 
 const MEMORY_SIZE: usize = 4096;
 const REGISTER_COUNT: usize = 16;
 const STACK_SIZE: usize = 16;
 
-const SCREEN_WIDTH: usize = 64;
-const SCREEN_HEIGHT: usize = 32;
+pub const SCREEN_WIDTH: usize = 64;
+pub const SCREEN_HEIGHT: usize = 32;
 
 const REG_V0: usize = 0x00;
 const REG_VF: usize = 0x0F;
@@ -17,6 +18,7 @@ const MEMORY_OFFSET: usize = 0x0200;
 
 const INSTRUCTION_SIZE: u16 = 2;
 
+#[derive(Debug)]
 pub struct Chip8<R: RngCore> {
     memory: [u8; MEMORY_SIZE],
     registers: [u8; REGISTER_COUNT],
@@ -24,13 +26,14 @@ pub struct Chip8<R: RngCore> {
     pub frame_buffer: [u8; SCREEN_WIDTH * SCREEN_HEIGHT / 8], // TODO: switch to private later
     sp: u8,     // stack pointer
     ir: u16,    // index register
-    dt: u8,     // delay timer
+    pub dt: u8,     // delay timer
     st: u8,     // sound timer
     pc: u16,    // program counter
     rng: R,
-    keypad_waiting: bool,
+    pub keypad_waiting: bool,
     keypad_reg: u8,
-    pub display_changed: bool
+    pub display_changed: bool,
+    pub sound_playing: bool
 }
 
 #[derive(Debug)]
@@ -70,8 +73,14 @@ enum ProgramCounterControl {
 
 impl<R: RngCore> Chip8<R> {
     pub fn new(rng: R) -> Self {
+        let mut memory = [0; MEMORY_SIZE];
+        // load hex into memory
+        for (ind, val) in HEXES_FLAT.iter().enumerate() {
+            memory[ind] = *val;
+        }
+
         Chip8 {
-            memory: [0; MEMORY_SIZE],
+            memory,
             registers: [0; REGISTER_COUNT],
             stack: [0; STACK_SIZE],
             frame_buffer: [0; SCREEN_WIDTH * SCREEN_HEIGHT / 8],
@@ -83,7 +92,8 @@ impl<R: RngCore> Chip8<R> {
             rng,
             keypad_waiting: false,
             keypad_reg: 0,
-            display_changed: false
+            display_changed: false,
+            sound_playing: false
         }
     }
 
@@ -142,7 +152,7 @@ impl<R: RngCore> Chip8<R> {
 
     // Call subroutine
     fn op_call(&mut self, addr: u16) -> Result<ProgramCounterControl, ChipError> {
-        self.stack_push(self.pc)?;
+        self.stack_push(self.pc + INSTRUCTION_SIZE)?;
         Ok(ProgramCounterControl::Jump(addr))
     }
 
@@ -180,7 +190,7 @@ impl<R: RngCore> Chip8<R> {
     }
 
     fn op_add(&mut self, reg: u8, val: u8) -> ProgramCounterControl {
-        self.registers[reg as usize] += val;
+        self.registers[reg as usize] = self.registers[reg as usize].overflowing_add(val).0;
         ProgramCounterControl::Next
     }
 
@@ -324,7 +334,7 @@ impl<R: RngCore> Chip8<R> {
     // skip if key not pressed
     fn op_sknp(&mut self, reg: u8, key_input: u16) -> ProgramCounterControl {
         let val = self.registers[reg as usize];
-        if (key_input & (1 << val)) == 0 {
+        if (key_input & (1u16 << val)) == 0 {
             ProgramCounterControl::Skip
         } else {
             ProgramCounterControl::Next
@@ -361,19 +371,24 @@ impl<R: RngCore> Chip8<R> {
         ProgramCounterControl::Next
     }
 
-    // TODO: implement hexadecimal sprites
     fn op_ld_f_vx(&mut self, reg: u8) -> ProgramCounterControl {
-        todo!("Implement hexadecimal sprites");
+        let digit = self.registers[reg as usize];
+        self.ir = ((digit & 0xF) * 5) as u16;
+        ProgramCounterControl::Next
     }
 
     fn op_ld_b_vx(&mut self, reg: u8) -> ProgramCounterControl {
-        todo!("Implement hexadecimal sprites");
+        let val = self.registers[reg as usize];
+        self.memory[self.ir as usize] = (val / 100) % 10;
+        self.memory[self.ir as usize+1] = (val / 10) % 10;
+        self.memory[self.ir as usize+2] = val % 10;
+        ProgramCounterControl::Next
     }
 
     // Stores registers v0 through vx into memory.
     fn op_ld_i_vx(&mut self, reg: u8) -> ProgramCounterControl {
         for ind in 0..(reg as usize+1) {
-            self.memory[self.ir as usize + ind] = self.registers[reg as usize + ind];
+            self.memory[self.ir as usize + ind] = self.registers[ind];
         } 
         ProgramCounterControl::Next
     }
@@ -381,12 +396,13 @@ impl<R: RngCore> Chip8<R> {
     // Reads registers v0 through vx from memory.
     fn op_ld_vx_i(&mut self, reg: u8) -> ProgramCounterControl {
         for ind in 0..(reg as usize+1) {
-            self.registers[reg as usize + ind] = self.memory[self.ir as usize + ind];
-        } 
+            self.registers[ind] = self.memory[self.ir as usize + ind];
+        }
         ProgramCounterControl::Next
     }
 
     fn run(&mut self, b1: u8, b2: u8, key_input: u16) -> Result<ProgramCounterControl, ChipError> {
+        //println!("{:02X}{:02X}", b1, b2);
         let top_b1 = b1 >> 4;
         let bottom_b1 = b1 & 0x0F;
         let top_b2 = b2 >> 4;
@@ -449,8 +465,6 @@ impl<R: RngCore> Chip8<R> {
     }
 
     pub fn tick(&mut self, key_input: u16) -> Result<(), ChipError> {
-        self.display_changed = false;
-
         if self.pc as usize > MEMORY_SIZE-INSTRUCTION_SIZE as usize {
             return Err(ChipError::ProgramCounterError(self.pc));
         }
@@ -465,11 +479,43 @@ impl<R: RngCore> Chip8<R> {
 
         Ok(())
     }
+
+    // Runs after 1/60 sec has elapsed and timers should be ticked down.
+    pub fn frame(&mut self) {
+        self.display_changed = false;
+        if self.dt > 0 {
+            self.dt -= 1;
+        }
+        if self.st > 0 {
+            self.st -= 1;
+        }
+        self.sound_playing = self.st > 0;
+    }
+
+    pub fn keypad_press(&mut self, key_press: u16) {
+        if self.keypad_waiting {
+            if let Some(bit) = get_lowest_bit_pos(key_press) {
+                self.keypad_waiting = false;
+
+                self.registers[self.keypad_reg as usize] = bit as u8;
+            }
+        }
+    }
 }
 
 // Gets the last three bits from an instruction.
 fn get_nnn(b1: u8, b2: u8) -> u16 {
     let x1 = b1 as u16;
     let x2 = b2 as u16;
-    return (x1 * 0x0100 + x2) & 0x0FFF;
+    (x1 * 0x0100 + x2) & 0x0FFF
+}
+
+// Get lowest set bit index
+fn get_lowest_bit_pos(num: u16) -> Option<u8> {
+    for i in 0..16 {
+        if (num & (1 << i)) > 0 {
+            return Some(i);
+        }
+    }
+    return None;
 }

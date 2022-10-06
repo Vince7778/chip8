@@ -6,4 +6,7 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+eframe = "0.19.0"
+egui = "0.19.0"
 rand = "0.8.5"
+spin_sleep = "1.1.1"
