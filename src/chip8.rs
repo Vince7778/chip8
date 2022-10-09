@@ -6,7 +6,7 @@ use std::{error::Error, fmt};
 use crate::hexes::HEXES_FLAT;
 
 pub const MEMORY_SIZE: usize = 4096;
-const REGISTER_COUNT: usize = 16;
+pub const REGISTER_COUNT: usize = 16;
 const STACK_SIZE: usize = 16;
 
 pub const SCREEN_WIDTH: usize = 64;
@@ -17,16 +17,16 @@ const REG_VF: usize = 0x0F;
 
 const MEMORY_OFFSET: usize = 0x0200;
 
-const INSTRUCTION_SIZE: u16 = 2;
+pub const INSTRUCTION_SIZE: u16 = 2;
 
 #[derive(Debug)]
 pub struct Chip8 {
     pub memory: [u8; MEMORY_SIZE],
-    registers: [u8; REGISTER_COUNT],
+    pub registers: [u8; REGISTER_COUNT],
     stack: [u16; STACK_SIZE],
     pub frame_buffer: [u8; SCREEN_WIDTH * SCREEN_HEIGHT / 8],
     sp: u8,     // stack pointer
-    ir: u16,    // index register
+    pub ir: u16,    // index register
     pub dt: u8,     // delay timer
     st: u8,     // sound timer
     pub pc: u16,    // program counter
@@ -34,7 +34,8 @@ pub struct Chip8 {
     pub keypad_waiting: bool,
     keypad_reg: u8,
     pub display_changed: bool,
-    pub sound_playing: bool
+    pub sound_playing: bool,
+    pub quirks_mode: QuirksMode
 }
 
 #[derive(Debug)]
@@ -72,6 +73,21 @@ enum ProgramCounterControl {
     Jump(u16)
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct QuirksMode {
+    pub shift: bool,
+    pub ldi: bool
+}
+
+impl Default for QuirksMode {
+    fn default() -> Self {
+        Self {
+            shift: false,
+            ldi: false
+        }
+    }
+}
+
 impl Chip8 {
     pub fn new(rng: Lcg64Xsh32) -> Self {
         let mut memory = [0; MEMORY_SIZE];
@@ -94,7 +110,8 @@ impl Chip8 {
             keypad_waiting: false,
             keypad_reg: 0,
             display_changed: false,
-            sound_playing: false
+            sound_playing: false,
+            quirks_mode: QuirksMode::default()
         }
     }
 
@@ -247,6 +264,14 @@ impl Chip8 {
         ProgramCounterControl::Next
     }
 
+    // quirky behavior that takes reg2 and shifts that instead
+    fn op_shr_quirky(&mut self, reg1: u8, reg2: u8) -> ProgramCounterControl {
+        let val = self.registers[reg2 as usize];
+        self.registers[reg1 as usize] = val >> 1;
+        self.registers[REG_VF] = val & 1;
+        ProgramCounterControl::Next
+    }
+
     // Subtract registers (but reg2-reg1 this time), setting VF if NO underflow
     fn op_subn_reg(&mut self, reg1: u8, reg2: u8) -> ProgramCounterControl {
         let val1 = self.registers[reg1 as usize];
@@ -261,6 +286,14 @@ impl Chip8 {
     fn op_shl(&mut self, reg: u8) -> ProgramCounterControl {
         let val = self.registers[reg as usize];
         self.registers[reg as usize] = val << 1;
+        self.registers[REG_VF] = (val >> 7) & 1;
+        ProgramCounterControl::Next
+    }
+
+    // quirky behavior that takes reg2 and shifts that instead
+    fn op_shl_quirky(&mut self, reg1: u8, reg2: u8) -> ProgramCounterControl {
+        let val = self.registers[reg2 as usize];
+        self.registers[reg1 as usize] = val << 1;
         self.registers[REG_VF] = (val >> 7) & 1;
         ProgramCounterControl::Next
     }
@@ -391,6 +424,10 @@ impl Chip8 {
         for ind in 0..(reg as usize+1) {
             self.memory[self.ir as usize + ind] = self.registers[ind];
         } 
+        // weird quirk
+        if self.quirks_mode.ldi {
+            self.ir += reg as u16 + 1;
+        }
         ProgramCounterControl::Next
     }
 
@@ -398,6 +435,9 @@ impl Chip8 {
     fn op_ld_vx_i(&mut self, reg: u8) -> ProgramCounterControl {
         for ind in 0..(reg as usize+1) {
             self.registers[ind] = self.memory[self.ir as usize + ind];
+        }
+        if self.quirks_mode.ldi {
+            self.ir += reg as u16 + 1;
         }
         ProgramCounterControl::Next
     }
@@ -431,9 +471,21 @@ impl Chip8 {
                 0x3 => Ok(self.op_xor(bottom_b1, top_b2)),
                 0x4 => Ok(self.op_add_reg(bottom_b1, top_b2)),
                 0x5 => Ok(self.op_sub_reg(bottom_b1, top_b2)),
-                0x6 => Ok(self.op_shr(bottom_b1)),
+                0x6 => {
+                    if self.quirks_mode.shift {
+                        Ok(self.op_shr_quirky(bottom_b1, top_b2))
+                    } else {
+                        Ok(self.op_shr(bottom_b1))
+                    }
+                },
                 0x7 => Ok(self.op_subn_reg(bottom_b1, top_b2)),
-                0xE => Ok(self.op_shl(bottom_b1)),
+                0xE => {
+                    if self.quirks_mode.shift {
+                        Ok(self.op_shl_quirky(bottom_b1, top_b2))
+                    } else {
+                        Ok(self.op_shl(bottom_b1))
+                    }
+                },
                 _ => Err(ChipError::BadOperationError(b1, b2))
             },
             0x9 => match bottom_b2 {
@@ -466,6 +518,9 @@ impl Chip8 {
     }
 
     pub fn tick(&mut self, key_input: u16) -> Result<(), ChipError> {
+        if self.keypad_waiting {
+            return Ok(());
+        }
         if self.pc as usize > MEMORY_SIZE-INSTRUCTION_SIZE as usize {
             return Err(ChipError::ProgramCounterError(self.pc));
         }
