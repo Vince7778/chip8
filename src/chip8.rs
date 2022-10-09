@@ -1,10 +1,9 @@
 // Contains the structure of the Chip8.
 
 use rand::RngCore;
+use rand_pcg::Lcg64Xsh32;
 use std::{error::Error, fmt};
 use crate::hexes::HEXES_FLAT;
-use crate::translator;
-use std::sync::{Arc, Mutex};
 
 pub const MEMORY_SIZE: usize = 4096;
 const REGISTER_COUNT: usize = 16;
@@ -21,17 +20,17 @@ const MEMORY_OFFSET: usize = 0x0200;
 const INSTRUCTION_SIZE: u16 = 2;
 
 #[derive(Debug)]
-pub struct Chip8<R: RngCore> {
-    memory: [u8; MEMORY_SIZE],
+pub struct Chip8 {
+    pub memory: [u8; MEMORY_SIZE],
     registers: [u8; REGISTER_COUNT],
     stack: [u16; STACK_SIZE],
-    pub frame_buffer: Arc<Mutex<[u8; SCREEN_WIDTH * SCREEN_HEIGHT / 8]>>, // TODO: switch to private later
+    pub frame_buffer: [u8; SCREEN_WIDTH * SCREEN_HEIGHT / 8],
     sp: u8,     // stack pointer
     ir: u16,    // index register
     pub dt: u8,     // delay timer
     st: u8,     // sound timer
-    pc: u16,    // program counter
-    rng: R,
+    pub pc: u16,    // program counter
+    rng: Lcg64Xsh32,
     pub keypad_waiting: bool,
     keypad_reg: u8,
     pub display_changed: bool,
@@ -73,8 +72,8 @@ enum ProgramCounterControl {
     Jump(u16)
 }
 
-impl<R: RngCore> Chip8<R> {
-    pub fn new(rng: R, frame_buffer: Arc<Mutex<[u8; SCREEN_WIDTH * SCREEN_HEIGHT / 8]>>) -> Self {
+impl Chip8 {
+    pub fn new(rng: Lcg64Xsh32) -> Self {
         let mut memory = [0; MEMORY_SIZE];
         // load hex into memory
         for (ind, val) in HEXES_FLAT.iter().enumerate() {
@@ -85,7 +84,7 @@ impl<R: RngCore> Chip8<R> {
             memory,
             registers: [0; REGISTER_COUNT],
             stack: [0; STACK_SIZE],
-            frame_buffer,
+            frame_buffer: [0; SCREEN_WIDTH * SCREEN_HEIGHT / 8],
             sp: 0,     // stack pointer
             ir: 0,    // index register
             dt: 0,     // delay timer
@@ -135,11 +134,9 @@ impl<R: RngCore> Chip8<R> {
 
     // Clear display
     fn op_cls(&mut self) -> ProgramCounterControl {
-        let mut w = self.frame_buffer.lock().unwrap();
-        for i in 0..w.len() {
-            w[i] = 0;
+        for i in 0..self.frame_buffer.len() {
+            self.frame_buffer[i] = 0;
         }
-        drop(w);
         ProgramCounterControl::Next
     }
 
@@ -300,8 +297,6 @@ impl<R: RngCore> Chip8<R> {
         let ypos = self.registers[regy as usize] as usize;
         let mut overlap = false;
 
-        let mut w = self.frame_buffer.lock().unwrap();
-
         for byte in 0..byte_count {
             let memory_byte = self.memory[self.ir as usize + byte as usize];
             let cur_y = (ypos + byte as usize) % SCREEN_HEIGHT;
@@ -310,7 +305,7 @@ impl<R: RngCore> Chip8<R> {
                 if (memory_byte & (1 << (7 - bit))) > 0 {
                     let cur_x = (xpos + bit as usize) % SCREEN_WIDTH;
                     let display_byte_index = (cur_y * SCREEN_WIDTH + cur_x) / 8;
-                    let display_byte = &mut w[display_byte_index];
+                    let display_byte = &mut self.frame_buffer[display_byte_index];
                     let display_bit_index = 7 - (cur_x % 8);
                     let display_mask = 1 << display_bit_index;
                     // check overlap
